@@ -64,12 +64,13 @@ elo_prob <- function(r1, r2, s) {
 # Pre-compute normalized match format
 data$format <- normalize_format(data$shape)
 
-# -----------------------------
-# Elo setup
-# -----------------------------
+# =============================
+# Full-sample Elo (diagnostics)
+# =============================
 
-K <- 48
+K <- 32
 initial_elo <- 1500
+s <- 450
 ratings <- new.env(parent = emptyenv())
 
 # Get current rating for a team (initialize if unseen)
@@ -108,9 +109,9 @@ for (i in seq_len(n)) {
   r2 <- get_rating(t2)
   
   # Pre-match win probability
-  p <- elo_prob(r1, r2, s = 450)
+  p <- elo_prob(r1, r2, s)
   
-  # Context-adjusted K
+  # Context-adjusted K (format + tournament importance)
   wf <- format_weight(data$format[i])
   wt <- importance_weight(data$stars_of_tournament[i])
   K_eff <- min(K * wf * wt, 3 * K)
@@ -150,25 +151,25 @@ data$logloss <- -(data$target * log(p_clip) +
 
 # Mean log loss
 mean_logloss <- mean(data$logloss, na.rm = TRUE)
-mean_logloss
 
-################ Calibration Plot ###################
+# -----------------------------
+# Calibration plot (full sample)
+# -----------------------------
 
-# Calibration bins
+# Bin predicted probabilities and compare to observed win rate
 n_bins <- 10
 bins <- cut(
   data$elo_p_team1_win,
   breaks = seq(0, 1, length.out = n_bins + 1),
   include.lowest = TRUE
 )
-# Aggregate
+
 calib <- aggregate(
   cbind(pred = data$elo_p_team1_win, y = data$target),
   by = list(bin = bins),
   FUN = mean
 )
 
-# Plot
 plot(
   calib$pred, calib$y,
   xlim = c(0, 1),
@@ -179,3 +180,136 @@ plot(
   pch = 19
 )
 abline(0, 1, lty = 2)
+
+# =============================
+# Time-based train/test split
+# =============================
+
+# Split data by date (train is before split_date, test is on/after split_date)
+split_date <- as.Date("2024-08-01")
+
+train_data <- subset(data, match_date < split_date)
+test_data  <- subset(data, match_date >= split_date)
+
+# Reset ratings so train/test is clean (no leakage from full-sample run)
+ratings <- new.env(parent = emptyenv())
+
+# -----------------------------
+# Train phase (build ratings)
+# -----------------------------
+
+for (i in seq_len(nrow(train_data))) {
+  t1 <- train_data$team1[i]
+  t2 <- train_data$team2[i]
+  y  <- train_data$target[i]  # 1 if team1 wins, else 0
+  
+  # Pre-match ratings
+  r1 <- get_rating(t1)
+  r2 <- get_rating(t2)
+  
+  # Pre-match win probability
+  p <- elo_prob(r1, r2, s)
+  
+  # Context-adjusted K
+  wf <- format_weight(train_data$format[i])
+  wt <- importance_weight(train_data$stars_of_tournament[i])
+  K_eff <- min(K * wf * wt, 3 * K)
+  
+  # Elo update
+  delta <- K_eff * (y - p)
+  set_rating(t1, r1 + delta)
+  set_rating(t2, r2 - delta)
+}
+
+# -----------------------------
+# Test phase (predict -> score -> update)
+# -----------------------------
+
+n_test <- nrow(test_data)
+test_pred <- numeric(n_test)
+
+for (i in seq_len(n_test)) {
+  t1 <- test_data$team1[i]
+  t2 <- test_data$team2[i]
+  y  <- test_data$target[i]
+  
+  # Pre-match ratings
+  r1 <- get_rating(t1)
+  r2 <- get_rating(t2)
+  
+  # Pre-match prediction (this is what gets evaluated)
+  p <- elo_prob(r1, r2, s)
+  test_pred[i] <- p
+  
+  # Update ratings after observing outcome
+  wf <- format_weight(test_data$format[i])
+  wt <- importance_weight(test_data$stars_of_tournament[i])
+  K_eff <- min(K * wf * wt, 3 * K)
+  
+  delta <- K_eff * (y - p)
+  set_rating(t1, r1 + delta)
+  set_rating(t2, r2 - delta)
+}
+
+# -----------------------------
+# Test log loss
+# -----------------------------
+
+eps <- 1e-15
+p_clip <- pmin(pmax(test_pred, eps), 1 - eps)
+
+test_logloss <- -(test_data$target * log(p_clip) +
+                    (1 - test_data$target) * log(1 - p_clip))
+
+mean_test_logloss <- mean(test_logloss, na.rm = TRUE)
+mean_test_logloss
+
+# -----------------------------
+# Calibration plot (test set)
+# -----------------------------
+
+n_bins <- 10
+bins <- cut(
+  test_pred,
+  breaks = seq(0, 1, length.out = n_bins + 1),
+  include.lowest = TRUE
+)
+
+calib_test <- aggregate(
+  cbind(pred = test_pred, y = test_data$target),
+  by = list(bin = bins),
+  FUN = mean
+)
+
+plot(
+  calib_test$pred, calib_test$y,
+  xlim = c(0, 1),
+  ylim = c(0, 1),
+  xlab = "Predicted win probability (test)",
+  ylab = "Observed win rate (test)",
+  main = "Test-Set Calibration Curve (Elo)",
+  pch = 19
+)
+abline(0, 1, lty = 2)
+
+# =============================
+# Simple matchup prediction
+# =============================
+
+# Predict P(team1 wins) using current ratings state
+predict_match <- function(team1, team2) {
+  r1 <- get_rating(team1)
+  r2 <- get_rating(team2)
+  p <- 1 / (1 + 10 ^ ((r2 - r1) / s))
+  
+  list(
+    team1 = team1,
+    team2 = team2,
+    rating_team1 = r1,
+    rating_team2 = r2,
+    prob_team1_win = p,
+    prob_team2_win = 1 - p
+  )
+}
+
+predict_match("Natus Vincere", "G2")
